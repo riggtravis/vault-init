@@ -1,4 +1,4 @@
-// Copyright 2018 Google Inc. All Rights Reserved.
+// Copyright 2018-2019 Google Inc, Travis Rigg. All Rights Reserved.
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 
@@ -21,25 +21,26 @@ import (
 	"syscall"
 	"time"
 
-	"cloud.google.com/go/storage"
-	"golang.org/x/oauth2/google"
-	"google.golang.org/api/cloudkms/v1"
-	"google.golang.org/api/option"
+	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/kms"
+	"github.com/aws/aws-sdk-go/service/s3"
 )
 
 var (
 	vaultAddr     string
 	checkInterval string
-	gcsBucketName string
+	s3BucketName  string
 	httpClient    http.Client
 
-	kmsService *cloudkms.Service
-	kmsKeyId   string
+	kmsKeyID string
 
-	storageClient *storage.Client
+	storageClient *s3.S3
 
 	userAgent = fmt.Sprintf("vault-init/0.1.0 (%s)", runtime.Version())
 )
+
+const unsealKeysKey string = "unseal-keys.json.enc"
 
 // InitRequest holds a Vault init request.
 type InitRequest struct {
@@ -71,6 +72,8 @@ type UnsealResponse struct {
 func main() {
 	log.Println("Starting the vault-init service...")
 
+	sess := session.Must(session.NewSession())
+
 	vaultAddr = os.Getenv("VAULT_ADDR")
 	if vaultAddr == "" {
 		vaultAddr = "https://127.0.0.1:8200"
@@ -78,7 +81,7 @@ func main() {
 
 	checkInterval = os.Getenv("CHECK_INTERVAL")
 	if checkInterval == "" {
-		checkInterval = "10"
+		checkInterval = "256"
 	}
 
 	i, err := strconv.Atoi(checkInterval)
@@ -88,40 +91,22 @@ func main() {
 
 	checkIntervalDuration := time.Duration(i) * time.Second
 
-	gcsBucketName = os.Getenv("GCS_BUCKET_NAME")
-	if gcsBucketName == "" {
-		log.Fatal("GCS_BUCKET_NAME must be set and not empty")
+	s3BucketName = os.Getenv("S3_BUCKET_NAME")
+	if s3BucketName == "" {
+		log.Fatal("S3_BUCKET_NAME must be set and not empty")
 	}
 
-	kmsKeyId = os.Getenv("KMS_KEY_ID")
-	if kmsKeyId == "" {
+	kmsKeyID = os.Getenv("KMS_KEY_ID")
+	if kmsKeyID == "" {
 		log.Fatal("KMS_KEY_ID must be set and not empty")
 	}
 
-	kmsCtx, kmsCtxCancel := context.WithCancel(context.Background())
+	_, kmsCtxCancel := context.WithCancel(context.Background())
 	defer kmsCtxCancel()
-	kmsClient, err := google.DefaultClient(kmsCtx, "https://www.googleapis.com/auth/cloudkms")
-	if err != nil {
-		log.Println(err)
-		return
-	}
 
-	kmsService, err = cloudkms.New(kmsClient)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-	kmsService.UserAgent = userAgent
-
-	storageCtx, storageCtxCancel := context.WithCancel(context.Background())
+	_, storageCtxCancel := context.WithCancel(context.Background())
 	defer storageCtxCancel()
-	storageClient, err = storage.NewClient(storageCtx,
-		option.WithUserAgent(userAgent),
-		option.WithScopes(storage.ScopeReadWrite),
-	)
-	if err != nil {
-		log.Fatal(err)
-	}
+	storageClient = s3.New(sess)
 
 	httpClient = http.Client{
 		Transport: &http.Transport{
@@ -190,6 +175,9 @@ func main() {
 }
 
 func initialize() {
+	sess := session.Must(session.NewSession())
+	kmsClient := kms.New(sess)
+
 	initRequest := InitRequest{
 		SecretShares:    5,
 		SecretThreshold: 3,
@@ -235,77 +223,107 @@ func initialize() {
 
 	log.Println("Encrypting unseal keys and the root token...")
 
-	rootTokenEncryptRequest := &cloudkms.EncryptRequest{
-		Plaintext: base64.StdEncoding.EncodeToString([]byte(initResponse.RootToken)),
-	}
+	rootTokenEncryptRequest, rootTokenEncryptResponse := kmsClient.EncryptRequest(&kms.EncryptInput{
+		KeyId:     &kmsKeyID,
+		Plaintext: []byte(initResponse.RootToken),
+	})
 
-	rootTokenEncryptResponse, err := kmsService.Projects.Locations.KeyRings.CryptoKeys.Encrypt(kmsKeyId, rootTokenEncryptRequest).Do()
+	err = rootTokenEncryptRequest.Send()
 	if err != nil {
 		log.Println(err)
 		return
 	}
 
-	unsealKeysEncryptRequest := &cloudkms.EncryptRequest{
-		Plaintext: base64.StdEncoding.EncodeToString(initRequestResponseBody),
-	}
+	unsealKeysEncryptRequest, unsealKeysEncryptResponse := kmsClient.EncryptRequest(&kms.EncryptInput{
+		KeyId:     &kmsKeyID,
+		Plaintext: initRequestResponseBody,
+	})
 
-	unsealKeysEncryptResponse, err := kmsService.Projects.Locations.KeyRings.CryptoKeys.Encrypt(kmsKeyId, unsealKeysEncryptRequest).Do()
+	err = unsealKeysEncryptRequest.Send()
 	if err != nil {
 		log.Println(err)
 		return
 	}
-
-	bucket := storageClient.Bucket(gcsBucketName)
 
 	// Save the encrypted unseal keys.
-	ctx := context.Background()
-	unsealKeysObject := bucket.Object("unseal-keys.json.enc").NewWriter(ctx)
-	defer unsealKeysObject.Close()
-
-	_, err = unsealKeysObject.Write([]byte(unsealKeysEncryptResponse.Ciphertext))
+	ukk := unsealKeysKey
+	_, err = storageClient.PutObject(&s3.PutObjectInput{
+		Body:   bytes.NewReader(unsealKeysEncryptResponse.CiphertextBlob),
+		Bucket: &s3BucketName,
+		Key:    &ukk,
+	})
 	if err != nil {
-		log.Println(err)
+		if aerr, ok := err.(awserr.Error); ok {
+			switch aerr.Code() {
+			default:
+				log.Println(aerr.Error())
+			}
+		} else {
+			log.Println(err.Error())
+		}
 	}
 
-	log.Printf("Unseal keys written to gs://%s/%s", gcsBucketName, "unseal-keys.json.enc")
+	log.Printf("Unseal keys written to s3://%s/%s", s3BucketName, unsealKeysKey)
 
 	// Save the encrypted root token.
-	rootTokenObject := bucket.Object("root-token.enc").NewWriter(ctx)
-	defer rootTokenObject.Close()
-
-	_, err = rootTokenObject.Write([]byte(rootTokenEncryptResponse.Ciphertext))
+	rootTokenKey := "root-token.enc"
+	_, err = storageClient.PutObject(&s3.PutObjectInput{
+		Body:   bytes.NewReader(rootTokenEncryptResponse.CiphertextBlob),
+		Bucket: &s3BucketName,
+		Key:    &rootTokenKey,
+	})
 	if err != nil {
-		log.Println(err)
+		if aerr, ok := err.(awserr.Error); ok {
+			switch aerr.Code() {
+			default:
+				log.Println(aerr.Error())
+			}
+		} else {
+			log.Println(err.Error())
+		}
 	}
 
-	log.Printf("Root token written to gs://%s/%s", gcsBucketName, "root-token.enc")
+	log.Printf("Root token written to s3://%s/%s", s3BucketName, rootTokenKey)
 
 	log.Println("Initialization complete.")
 }
 
 func unseal() {
-	bucket := storageClient.Bucket(gcsBucketName)
+	sess := session.Must(session.NewSession())
+	kmsClient := kms.New(sess)
 
-	ctx := context.Background()
-	unsealKeysObject, err := bucket.Object("unseal-keys.json.enc").NewReader(ctx)
+	bucketURI := "s3://" + s3BucketName
+	ukk := unsealKeysKey
+	unsealKeysObject, err := storageClient.GetObject(&s3.GetObjectInput{
+		Bucket: &bucketURI,
+		Key:    &ukk,
+	})
+	if err != nil {
+		if aerr, ok := err.(awserr.Error); ok {
+			switch aerr.Code() {
+			case s3.ErrCodeNoSuchKey:
+				log.Println(s3.ErrCodeNoSuchKey, aerr.Error())
+			default:
+				log.Println(aerr.Error())
+			}
+		} else {
+			log.Println(err.Error())
+		}
+		return
+	}
+
+	unsealKeysData, err := ioutil.ReadAll(unsealKeysObject.Body)
 	if err != nil {
 		log.Println(err)
 		return
 	}
 
-	defer unsealKeysObject.Close()
+	// TODO: adjust to use KMS grants
+	unsealKeysDecryptRequest, unsealKeysDecryptResponse := kmsClient.DecryptRequest(&kms.DecryptInput{
+		CiphertextBlob: unsealKeysData,
+	})
 
-	unsealKeysData, err := ioutil.ReadAll(unsealKeysObject)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-
-	unsealKeysDecryptRequest := &cloudkms.DecryptRequest{
-		Ciphertext: string(unsealKeysData),
-	}
-
-	unsealKeysDecryptResponse, err := kmsService.Projects.Locations.KeyRings.CryptoKeys.Decrypt(kmsKeyId, unsealKeysDecryptRequest).Do()
+	err = unsealKeysDecryptRequest.Send()
 	if err != nil {
 		log.Println(err)
 		return
@@ -313,7 +331,7 @@ func unseal() {
 
 	var initResponse InitResponse
 
-	unsealKeysPlaintext, err := base64.StdEncoding.DecodeString(unsealKeysDecryptResponse.Plaintext)
+	unsealKeysPlaintext, err := base64.StdEncoding.DecodeString(string(unsealKeysDecryptResponse.Plaintext))
 	if err != nil {
 		log.Println(err)
 		return

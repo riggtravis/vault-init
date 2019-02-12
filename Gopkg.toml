@@ -24,18 +24,21 @@
 #   go-tests = true
 #   unused-packages = true
 
+[[constraint]]
+  branch="master"
+	name="github.com/aws/aws-sdk-go/aws/awserr"
 
 [[constraint]]
-  name = "cloud.google.com/go"
-  version = "0.21.0"
-
+  branch="master"
+	name="github.com/aws/aws-sdk-go/aws/session"
+  
 [[constraint]]
-  branch = "master"
-  name = "golang.org/x/oauth2"
-
+  branch="master"
+	name="github.com/aws/aws-sdk-go/service/kms"
+  
 [[constraint]]
-  branch = "master"
-  name = "google.golang.org/api"
+  branch="master"
+	name="github.com/aws/aws-sdk-go/service/s3"
 
 [prune]
   go-tests = true
